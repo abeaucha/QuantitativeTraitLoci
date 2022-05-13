@@ -1,0 +1,196 @@
+---
+title: "Untitled"
+author: "Antoine Beauchamp"
+date: '2022-05-13'
+output: 
+  html_document:
+    theme: paper
+    highlight: pygments
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries}
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(data.tree))
+suppressPackageStartupMessages(library(RMINC))
+suppressPackageStartupMessages(library(MRIcrotome))
+suppressPackageStartupMessages(library(lme4))
+```
+
+First we import a data frame containing strain and cohort information.
+
+```{r}
+dfStrains <- readRDS('./jason_example/BXAandBXDmice.RDS')
+head(dfStrains)
+```
+```{r}
+dfStrains %>% 
+  group_by(Cohort, Strain) %>% 
+  count() %>% 
+  ungroup() %>% 
+  head()
+```
+
+
+Next we want to get the volume information. This is stored in a two data trees: One for the BXD cohort and one for the BXA cohort. We want to import these and then combine these trees into one. 
+
+```{r}
+#Import BXA and BXD trees
+treeBXA <- readRDS("./jason_example/BXAdatatree.RDS")
+treeBXD <- readRDS("./jason_example/BXDdatatree.RDS")
+
+#Create a copy of BXAtree
+treeAllStrains <- Clone(treeBXA)
+
+#Combine BXA and BXD volumes at every node
+treeAllStrains$Do(function(node){
+  node$volumes <- c(FindNode(treeBXA, name = node$name)[['volumes']],
+                    FindNode(treeBXD, name = node$name)[['volumes']])
+})
+
+#Extract whole brain volumes
+volumesWholeBrain <- treeAllStrains[['volumes']]
+
+#Compute relative volumes by regressing out total brain volume
+treeAllStrains$Do(function(node){
+  node$volumes_rel <- residuals(lm(node$volumes ~ volumesWholeBrain))
+})
+```
+
+We can take a quick look at how the distributions of brain volumes vary over the recombinant inbred strains. Here we use total brain volumes as an example: 
+
+```{r fig.width = 10}
+dfExample <- dfStrains %>% 
+  mutate(volumes = volumesWholeBrain) %>% 
+  unite(Levels, Cohort, Strain, sep = '-', remove = FALSE) %>% 
+  mutate(Levels = factor(Levels),
+         Strain = factor(Strain, levels = unique(Strain[order(Levels)]))) %>% 
+  filter(Strain != 'B6')
+
+ggplot(dfExample, aes(x = volumes, y = fct_rev(Strain), col = Cohort)) + 
+  geom_point() + 
+  geom_boxplot(alpha = 0.5, outlier.fill = NA) + 
+  labs(x = "Total brain volume (mm^3)", y = "Strain") + 
+  theme_bw()
+```
+
+Now, for each region in the brain, we would like to quantify how heritable the region volume is. In other words, how much variation do we find between the different strains? 
+
+A simple way to do this is to quantify how the average brain region volume varies over the different strains. We can model this using a random intercept model. Here's an example for the whole brain volumes:
+
+```{r}
+model_example <- lmer(volumes ~ 1 + (1|Strain), data = dfExample)
+VarCorr(model_example)
+```
+
+We find that the variation attributable to strains gives rise to a standard deviation of 25.65, while the remaining variation has a standard deviation of 17.44. We can extract the proper variances as follows:
+
+```{r}
+(variances <- as.data.frame(VarCorr(model_example))[,'vcov'])
+```
+
+These are just the squares of the standard deviations above. The first value is for the random intercept, the second value is the residual variance. The total variance is just the sum of these. Thus we can compute how much of the total variance in volumes is attributable to strain by taking a ratio:
+
+```{r}
+variances[1]/sum(variances)
+```
+
+We find that about 68% of the variation in total brain volume is attributable to strain. This is a measure of the heritability of total brain volume. 
+
+Now we want to repeat this process for all regions in our ontology, and for absolute as well as relative volumes. 
+
+```{r}
+#Function to run the heritability model
+calc_heritability <- function(values, strains) {
+  df <- data.frame(values = values,
+                   strains = strains)
+  l <- lmer(values ~ 1  + (1|strains), data = df)
+  vc <- as.data.frame(VarCorr(l))$vcov
+  return(vc[1] / sum(vc))
+}
+
+#Compute heritability on absolute and relative volumes at every node
+treeAllStrains$Do(function(node){
+  node$heritability_abs <- calc_heritability(values = node$volumes, strains = dfStrains$Strain)
+  node$heritability_rel <- calc_heritability(values = node$volumes_rel, strains = dfStrains$Strain)
+})
+```
+
+The singular fit error results from the relative volumes at the root node of the tree, which are all defined to be 1. No need to worry about this. 
+
+We can now take a look at the heritability of different volumes over the entire brain:
+
+```{r fig.width = 6}
+dsurqe_template <- mincArray(mincGetVolume('/projects/tools/atlases/Dorr_2008_Steadman_2013_Ullmann_2013_Richards_2011_Qiu_2016_Egan_2015_Elder_2019_40micron/ex-vivo/DSURQEE_40micron_average.mnc'))
+dsurqe_labels <- mincArray(mincGetVolume('/projects/tools/atlases/Dorr_2008_Steadman_2013_Ullmann_2013_Richards_2011_Qiu_2016_Egan_2015_Elder_2019_40micron/ex-vivo/DSURQEE_40micron_labels.mnc'))
+
+sliceSeries(nrow=6, ncol=1, begin=75, end=350) %>%
+  anatomy(dsurqe_template, low=700, high=1400) %>%
+  addtitle("T2w MRI") %>%
+  sliceSeries() %>%
+  anatomy() %>%
+  overlay(hanatToVolume(treeAllStrains, dsurqe_labels, "heritability_abs"), low=0.2, high=0.7) %>%
+  addtitle("Absolute volumes") %>%
+  sliceSeries() %>%
+  anatomy() %>%
+  overlay(hanatToVolume(treeAllStrains, dsurqe_labels, "heritability_rel"), low=0.2, high=0.7) %>%
+  addtitle("Relative volumes") %>%
+  legend("Heritability (% variance explained)") %>%
+  draw()
+```
+
+The next step is to identify which genes are associated with this variation. This is done using a quantitative trait loci analysis. The recombinant inbred strains have been completely genotyped, so given any quantitative trait, we can determine which genetic loci are associated with that trait. We can do this using a web application from the University of Tennessee called GeneNetwork. 
+
+# Preparing the data for quantitative trait loci analysis
+
+To use GeneNetwork, we first have to get the quantitative traits in the right format. Importantly, the genetic data is only available for the BXD family of strains, so we'll need to filter out the BXA family. Basically, we just need to flatten the data tree into a matrix and then get strain-wise summary statistics for each region. The statistics we'll use are the mean and standard deviation.
+
+```{r}
+#Get BXD volume means
+df_bxd_volumes_mean <- treeAllStrains$Get('volumes') %>% 
+  as_tibble() %>% 
+  bind_cols(dfStrains) %>% 
+  filter(Cohort == 'BXD') %>% 
+  select(-Cohort) %>% 
+  group_by(Strain) %>% 
+  summarise_all(.funs = mean) %>% 
+  ungroup() %>% 
+  mutate(Strain = fct_recode(Strain,
+                             "C57BL/6J" = "B6",
+                             "DBA/2J" = "DBA"),
+         `@format`=Strain)
+
+#Get BXD volume standard deviations
+df_bxd_volumes_sd <- treeAllStrains$Get('volumes') %>% 
+  as_tibble() %>% 
+  bind_cols(dfStrains) %>% 
+  filter(Cohort == 'BXD') %>% 
+  select(-Cohort) %>% 
+  group_by(Strain) %>% 
+  summarise_all(.funs = sd) %>% 
+  ungroup() %>% 
+  mutate(Strain = fct_recode(Strain,
+                             "C57BL/6J" = "B6",
+                             "DBA/2J" = "DBA"),
+         `@format`=Strain)
+
+#Write data sets to file
+write_tsv(x = df_bxd_volumes_mean,
+          file = 'data/BXD_volumes_mean.tsv')
+
+write_tsv(x = df_bxd_volumes_sd,
+          file = 'data/BXD_volumes_sd.tsv')
+```
+
+We can then use these files to run the QTL analysis on GeneNetwork. Here is the process:
+
+1. Go to http://gn1.genenetwork.org/webqtl/main.py?FormID=batSubmit
+2. Under the "Batch Trait Submission Utility" header: Select "BXD Family" from the cross or recombinant inbred set menu.
+3. Under the "Batch Trait Submission Utility" header: Upload the TSV file containing the quantitative traits. 
+4. Under the "Batch Trait Submission Utility" header: Specify a name for the data set.
+5. Click on "Next"
+6. 
+
