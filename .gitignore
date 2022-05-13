@@ -1,2 +1,4 @@
 jason_example/__MACOSX/
 .Rhistory
+data/BXD_volumes_mean.tsv
+data/BXD_volumes_sd.tsv
